@@ -1,62 +1,186 @@
+"""
+API HTTP du service Telethon.
+
+Sécurité : toutes les routes (sauf /health) exigent le header
+    X-Service-Auth: <SERVICE_API_KEY>
+qui doit correspondre à la variable d'env SERVICE_API_KEY.
+
+C'est l'app Lovable qui appelle ces routes (jamais le navigateur de
+l'utilisateur final directement).
+"""
+import asyncio
 import os
+from contextlib import asynccontextmanager
+from typing import Optional
+
 from fastapi import FastAPI, Header, HTTPException
-from telethon import TelegramClient, StringSession
 from pydantic import BaseModel
-import httpx
 
-app = FastAPI()
+import telegram_client as tg
 
-# Configuration (Railway récupère ces variables automatiquement)
-API_ID = int(os.getenv("TELEGRAM_API_ID", 0))
-API_HASH = os.getenv("TELEGRAM_API_HASH", "")
-SERVICE_API_KEY = os.getenv("SERVICE_API_KEY")
-URL_WEBHOOK_LOVABLE = os.getenv("URL_WEBHOOK_LOVABLE")
+SERVICE_API_KEY = os.environ.get("SERVICE_API_KEY", "")
 
-# Dictionnaire temporaire pour stocker les clients en cours de connexion
-clients = {}
 
-class LoginRequest(BaseModel):
-    phone: str
+def _check_auth(x_service_auth: Optional[str]) -> None:
+    if not SERVICE_API_KEY:
+        raise HTTPException(500, "SERVICE_API_KEY non configuré côté service")
+    if not x_service_auth or x_service_auth != SERVICE_API_KEY:
+        raise HTTPException(401, "Unauthorized")
 
-class VerifyRequest(BaseModel):
-    phone: str
-    code: str
-    phone_code_hash: str
 
-@app.get("/")
-async def root():
-    return {"status": "Moteur Telethon Actif"}
-
-# 1. Demander l'envoi du code SMS
-@app.post("/send-code")
-async def send_code(req: LoginRequest, x_api_key: str = Header(None)):
-    if x_api_key != SERVICE_API_KEY:
-        raise HTTPException(status_code=403, detail="Clé API invalide")
-    
-    client = TelegramClient(StringSession(), API_ID, API_HASH)
-    await client.connect()
-    result = await client.send_code_request(req.phone)
-    clients[req.phone] = {"client": client, "hash": result.phone_code_hash}
-    
-    return {"phone_code_hash": result.phone_code_hash}
-
-# 2. Vérifier le code et créer la session
-@app.post("/verify-code")
-async def verify_code(req: VerifyRequest, x_api_key: str = Header(None)):
-    if x_api_key != SERVICE_API_KEY:
-        raise HTTPException(status_code=403, detail="Clé API invalide")
-    
-    data = clients.get(req.phone)
-    if not data:
-        raise HTTPException(status_code=400, detail="Session expirée")
-    
-    client = data["client"]
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    print("[startup] restauration des sessions Telethon")
     try:
-        await client.sign_in(req.phone, req.code, phone_code_hash=req.phone_code_hash)
-        session_string = client.session.save()
-        return {"session_string": session_string, "status": "connected"}
-    except Exception as e:
-        return {"error": str(e)}
+        await tg.restore_all_sessions()
+    except Exception as exc:
+        print(f"[startup] erreur restore: {exc}")
+    yield
+    print("[shutdown] déconnexion des clients")
 
-# 3. Ecouteur de messages (Webhook vers Lovable)
-# Note: Pour un SaaS complet, ce bloc nécessite un "worker" séparé qui tourne 24/7
+
+app = FastAPI(title="Opsis Telethon Service", lifespan=lifespan)
+
+
+@app.get("/health")
+async def health():
+    return {"ok": True, "service": "telethon", "active_clients": len(tg._clients)}
+
+
+# ---------- Login QR ----------
+
+class StartQRBody(BaseModel):
+    owner_id: str
+    account_id: str
+
+
+@app.post("/accounts/login/qr/start")
+async def qr_start(body: StartQRBody, x_service_auth: Optional[str] = Header(None)):
+    _check_auth(x_service_auth)
+    return await tg.start_qr_login(owner_id=body.owner_id, account_id=body.account_id)
+
+
+class CheckQRBody(BaseModel):
+    account_id: str
+
+
+@app.post("/accounts/login/qr/check")
+async def qr_check(body: CheckQRBody, x_service_auth: Optional[str] = Header(None)):
+    _check_auth(x_service_auth)
+    return await tg.check_qr_login(account_id=body.account_id)
+
+
+class TwoFABody(BaseModel):
+    account_id: str
+    password: str
+
+
+@app.post("/accounts/login/2fa")
+async def login_2fa(body: TwoFABody, x_service_auth: Optional[str] = Header(None)):
+    _check_auth(x_service_auth)
+    return await tg.submit_2fa_password(account_id=body.account_id, password=body.password)
+
+
+# ---------- Login par numéro de téléphone ----------
+
+class StartPhoneBody(BaseModel):
+    owner_id: str
+    account_id: str
+    phone: str
+
+
+@app.post("/accounts/login/phone/send-code")
+async def phone_send_code(body: StartPhoneBody, x_service_auth: Optional[str] = Header(None)):
+    _check_auth(x_service_auth)
+    return await tg.send_phone_code(
+        owner_id=body.owner_id,
+        account_id=body.account_id,
+        phone=body.phone,
+    )
+
+
+# Alias rétro-compatible
+@app.post("/accounts/login/phone/start")
+async def phone_start(body: StartPhoneBody, x_service_auth: Optional[str] = Header(None)):
+    _check_auth(x_service_auth)
+    return await tg.send_phone_code(
+        owner_id=body.owner_id,
+        account_id=body.account_id,
+        phone=body.phone,
+    )
+
+
+class PhoneCodeBody(BaseModel):
+    account_id: str
+    code: str
+    phone_code_hash: Optional[str] = None
+
+
+@app.post("/accounts/login/phone/verify-code")
+async def phone_verify_code(body: PhoneCodeBody, x_service_auth: Optional[str] = Header(None)):
+    _check_auth(x_service_auth)
+    return await tg.verify_phone_code(
+        account_id=body.account_id,
+        code=body.code,
+        phone_code_hash=body.phone_code_hash,
+    )
+
+
+# Alias rétro-compatible
+@app.post("/accounts/login/phone/code")
+async def phone_code(body: PhoneCodeBody, x_service_auth: Optional[str] = Header(None)):
+    _check_auth(x_service_auth)
+    return await tg.verify_phone_code(
+        account_id=body.account_id,
+        code=body.code,
+        phone_code_hash=body.phone_code_hash,
+    )
+
+
+# ---------- Opérations ----------
+
+class DisconnectBody(BaseModel):
+    account_id: str
+
+
+@app.post("/accounts/disconnect")
+async def disconnect(body: DisconnectBody, x_service_auth: Optional[str] = Header(None)):
+    _check_auth(x_service_auth)
+    await tg.disconnect_account(body.account_id)
+    return {"ok": True}
+
+
+class SendBody(BaseModel):
+    account_id: str
+    telegram_chat_id: int
+    body: str
+
+
+@app.post("/messages/send")
+async def send(body: SendBody, x_service_auth: Optional[str] = Header(None)):
+    _check_auth(x_service_auth)
+    return await tg.send_message(
+        account_id=body.account_id,
+        telegram_chat_id=body.telegram_chat_id,
+        body=body.body,
+    )
+
+
+class SyncBody(BaseModel):
+    account_id: str
+    max_chats: int = 50
+    max_messages_per_chat: int = 200
+
+
+@app.post("/sync/history")
+async def sync_history(body: SyncBody, x_service_auth: Optional[str] = Header(None)):
+    _check_auth(x_service_auth)
+    # Lance la sync en tâche de fond, retourne immédiatement
+    asyncio.create_task(
+        tg.sync_history(
+            account_id=body.account_id,
+            max_chats=body.max_chats,
+            max_messages_per_chat=body.max_messages_per_chat,
+        )
+    )
+    return {"ok": True, "started": True}
