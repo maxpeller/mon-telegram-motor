@@ -3,6 +3,18 @@ Stockage des sessions Telethon dans Supabase.
 
 On utilise StringSession (sérialisation texte) plutôt que des fichiers .session
 pour que le service puisse redémarrer sans perdre les connexions Telegram.
+
+Table attendue côté Supabase (créée par migration Lovable) :
+    telethon_sessions (
+        id uuid pk,
+        owner_id uuid,
+        account_id uuid,
+        session_string text,
+        telegram_user_id bigint,
+        phone_number text,
+        created_at timestamptz,
+        updated_at timestamptz
+    )
 """
 import os
 from typing import Any, Optional
@@ -25,6 +37,7 @@ def storage_backend() -> str:
 
 
 def _db_url_with_ssl() -> str:
+    """Retourne l'URL Postgres avec sslmode=require si absent."""
     if not SUPABASE_DB_URL:
         return ""
     parts = urlsplit(SUPABASE_DB_URL)
@@ -37,7 +50,28 @@ def _has_direct_db() -> bool:
     return bool(SUPABASE_DB_URL)
 
 
+def db_health_check() -> dict:
+    """Vérifie la connectivité DB. Retourne un dict utilisable par /health."""
+    if not SUPABASE_DB_URL:
+        return {"ok": False, "error": "SUPABASE_DB_URL absent"}
+    try:
+        with _connect_db() as conn, conn.cursor() as cur:
+            cur.execute("select 1 as ok")
+            cur.fetchone()
+            cur.execute("select count(*)::int as n from public.telethon_sessions")
+            n = cur.fetchone()
+        return {"ok": True, "telethon_sessions_count": (n or {}).get("n", 0)}
+    except Exception as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
 def _connect_db():
+    """
+    Connexion SQL directe.
+
+    On privilégie Postgres direct pour éviter le cache REST PostgREST qui peut
+    rester bloqué sur PGRST205 malgré l'existence de la table.
+    """
     try:
         import psycopg
         from psycopg.rows import dict_row
@@ -78,10 +112,16 @@ def get_supabase() -> Any:
             from supabase import create_client
         except ImportError as exc:
             raise RuntimeError(
-                "Le package supabase est requis si SUPABASE_DB_URL n'est pas configuré."
+                "Le package supabase est requis si SUPABASE_DB_URL n'est pas configuré. "
+                "Ajoutez SUPABASE_DB_URL pour utiliser l'accès direct recommandé."
             ) from exc
         if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
             raise RuntimeError("SUPABASE_URL et SUPABASE_SERVICE_ROLE_KEY doivent être configurés")
+        if "supabase.co" in SUPABASE_SERVICE_ROLE_KEY or SUPABASE_SERVICE_ROLE_KEY.startswith("http"):
+            raise RuntimeError(
+                "SUPABASE_SERVICE_ROLE_KEY contient une URL au lieu de la clé service_role. "
+                "Corrigez la variable sur Railway."
+            )
         if not SUPABASE_SERVICE_ROLE_KEY.startswith("eyJ"):
             raise RuntimeError(
                 "SUPABASE_SERVICE_ROLE_KEY doit être la clé service_role JWT, pas la clé anon/publishable."
@@ -91,6 +131,7 @@ def get_supabase() -> Any:
 
 
 def load_session(account_id: str) -> Optional[str]:
+    """Récupère la session_string Telethon pour un compte."""
     if _has_direct_db():
         with _connect_db() as conn, conn.cursor() as cur:
             cur.execute(
@@ -117,6 +158,38 @@ def load_session(account_id: str) -> Optional[str]:
     if rows and rows[0].get("session_string"):
         return rows[0]["session_string"]
     return None
+
+
+def load_session_record(account_id: str) -> Optional[dict]:
+    """Récupère la session complète pour reconnecter un compte après redémarrage/scale Railway."""
+    if _has_direct_db():
+        with _connect_db() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                select owner_id::text, account_id::text, session_string, telegram_user_id, phone_number
+                from public.telethon_sessions
+                where account_id = %s
+                limit 1
+                """,
+                (account_id,),
+            )
+            return cur.fetchone()
+    try:
+        res = (
+            get_supabase()
+            .table("telethon_sessions")
+            .select("owner_id,account_id,session_string,telegram_user_id,phone_number")
+            .eq("account_id", account_id)
+            .limit(1)
+            .execute()
+        )
+        rows = res.data or []
+        return rows[0] if rows else None
+    except Exception as exc:
+        if _is_schema_cache_error(exc):
+            _warn_schema_cache("load_session_record", exc)
+            return None
+        _raise_cache_hint(exc)
 
 
 def save_session(
@@ -149,7 +222,12 @@ def save_session(
                     updated_at = now()
                 where account_id = %s
                 """,
-                (session_string, telegram_user_id, phone_number, account_id),
+                (
+                    session_string,
+                    telegram_user_id,
+                    phone_number,
+                    account_id,
+                ),
             )
             if cur.rowcount == 0:
                 cur.execute(
@@ -158,7 +236,13 @@ def save_session(
                         (owner_id, account_id, session_string, telegram_user_id, phone_number, updated_at)
                     values (%s, %s, %s, %s, %s, now())
                     """,
-                    (owner_id, account_id, session_string, telegram_user_id, phone_number),
+                    (
+                        owner_id,
+                        account_id,
+                        session_string,
+                        telegram_user_id,
+                        phone_number,
+                    ),
                 )
         return
 
@@ -174,6 +258,7 @@ def save_session(
 
 
 def list_all_sessions() -> list[dict]:
+    """Toutes les sessions à reconnecter au démarrage du service."""
     if _has_direct_db():
         with _connect_db() as conn, conn.cursor() as cur:
             cur.execute(
