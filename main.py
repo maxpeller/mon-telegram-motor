@@ -23,7 +23,7 @@ import telegram_client as tg
 from sync_store import get_sync_status, set_sync_status
 
 SERVICE_API_KEY = os.environ.get("SERVICE_API_KEY", "")
-SERVICE_VERSION = "2026-04-27-sync-reconnect-before-history"
+SERVICE_VERSION = "2026-04-27-direct-db-sync"
 
 
 def _check_auth(x_service_auth: Optional[str]) -> None:
