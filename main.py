@@ -18,9 +18,11 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from sessions_store import storage_backend
 import telegram_client as tg
 
 SERVICE_API_KEY = os.environ.get("SERVICE_API_KEY", "")
+SERVICE_VERSION = "2026-04-27-cache-safe-sessions"
 
 
 def _check_auth(x_service_auth: Optional[str]) -> None:
@@ -57,7 +59,13 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "service": "telethon", "active_clients": len(tg._clients)}
+    return {
+        "ok": True,
+        "service": "telethon",
+        "version": SERVICE_VERSION,
+        "active_clients": len(tg._clients),
+        "session_storage": storage_backend(),
+    }
 
 
 # ---------- Login QR ----------
@@ -188,7 +196,6 @@ class SyncBody(BaseModel):
 @app.post("/sync/history")
 async def sync_history(body: SyncBody, x_service_auth: Optional[str] = Header(None)):
     _check_auth(x_service_auth)
-    # Lance la sync en tâche de fond, retourne immédiatement
     asyncio.create_task(
         tg.sync_history(
             account_id=body.account_id,
@@ -197,3 +204,4 @@ async def sync_history(body: SyncBody, x_service_auth: Optional[str] = Header(No
         )
     )
     return {"ok": True, "started": True}
+
