@@ -1,19 +1,12 @@
 """
-Gestion multi-comptes Telethon.
+Gestion multi-comptes Telethon (VERSION FIX LIVE EVENTS)
 
-Chaque compte Telegram (= 1 ligne dans `telegram_accounts` côté Lovable) a son
-propre TelegramClient stocké en mémoire. Les sessions sont sérialisées en
-StringSession et persistées dans Supabase pour survivre aux redémarrages.
-
-Login par QR code (recommandé pour multi-comptes utilisateur) :
-    1. POST /accounts/{account_id}/login/qr/start  -> renvoie qr_url + token
-    2. L'utilisateur scanne avec son téléphone (Telegram → Paramètres → Appareils → Lier un appareil)
-    3. POST /accounts/{account_id}/login/qr/check  -> renvoie status (waiting / 2fa_required / success)
-    4. Si 2FA activé : POST /accounts/{account_id}/login/2fa { password }
-
-Une fois connecté, un event handler temps réel écrit directement en base quand
-SUPABASE_DB_URL est configuré, puis tente aussi le webhook en secours.
+✔ Sessions persistées Supabase
+✔ QR login + phone login
+✔ Sync historique
+✔ EVENTS TEMPS RÉEL FIXÉ (run_until_disconnected)
 """
+
 import asyncio
 import os
 from typing import Dict, Optional
@@ -26,129 +19,228 @@ from telethon.errors import (
     SessionPasswordNeededError,
 )
 from telethon.sessions import StringSession
-from telethon.tl.custom import QRLogin
 from telethon.tl.types import User
 
-from sessions_store import delete_session, list_all_sessions, load_session, load_session_record, save_session
+from sessions_store import delete_session, list_all_sessions, load_session_record, save_session
 from sync_store import direct_storage_enabled, upsert_incoming, upsert_sync_chat
 from webhook import post_to_lovable
+
+# ---------------- CONFIG ----------------
 
 API_ID = int(os.environ.get("TELEGRAM_API_ID", "0"))
 API_HASH = os.environ.get("TELEGRAM_API_HASH", "")
 
-# Clients Telethon actifs en mémoire : { account_id: TelegramClient }
 _clients: Dict[str, TelegramClient] = {}
-# Owner de chaque account (pour les webhooks) : { account_id: owner_id }
 _owners: Dict[str, str] = {}
-# Logins QR en cours : { account_id: QRLogin }
+
 _pending_qr: Dict[str, dict] = {}
-# Logins QR en attente de 2FA : { account_id: TelegramClient }
 _pending_2fa: Dict[str, TelegramClient] = {}
-# Logins par téléphone en attente du code SMS
 _pending_phone: Dict[str, dict] = {}
 
+# ---------------- KEEP ALIVE LOOP ----------------
+
+async def _run_client_forever(client: TelegramClient, account_id: str):
+    """
+    🔥 CRITIQUE : permet de recevoir les messages temps réel
+    sans ça → aucun event Telethon
+    """
+    print(f"[telethon] 🔁 loop active {account_id}")
+    try:
+        await client.run_until_disconnected()
+    except Exception as e:
+        print(f"[telethon] ❌ loop crash {account_id}: {e}")
+
+# ---------------- CLIENT ----------------
 
 def _new_client(session_string: Optional[str] = None) -> TelegramClient:
     if not API_ID or not API_HASH:
-        raise RuntimeError("TELEGRAM_API_ID et TELEGRAM_API_HASH doivent être configurés")
+        raise RuntimeError("TELEGRAM_API_ID / TELEGRAM_API_HASH manquants")
+
     session = StringSession(session_string) if session_string else StringSession()
-    return TelegramClient(session, API_ID, API_HASH, device_model="Opsis CRM", system_version="1.0")
+    return TelegramClient(session, API_ID, API_HASH)
 
+# ---------------- HANDLERS ----------------
 
-def _attach_handlers(client: TelegramClient, owner_id: str, account_id: str) -> None:
-    """Branche les listeners temps réel : nouveaux messages entrants/sortants."""
+def _attach_handlers(client: TelegramClient, owner_id: str, account_id: str):
 
     @client.on(events.NewMessage(incoming=True))
-    async def on_incoming(event):
-        await _forward_message(event, owner_id, account_id, direction="in")
+    async def incoming(event):
+        await _forward(event, owner_id, account_id, "in")
 
     @client.on(events.NewMessage(outgoing=True))
-    async def on_outgoing(event):
-        await _forward_message(event, owner_id, account_id, direction="out")
+    async def outgoing(event):
+        await _forward(event, owner_id, account_id, "out")
 
+# ---------------- FORWARD MESSAGE ----------------
 
-# Diagnostic : on garde trace des dernières opérations de persistance
-_last_persist_error: Optional[dict] = None
-_persist_counters: Dict[str, int] = {"sync_chat_ok": 0, "sync_chat_err": 0, "incoming_ok": 0, "incoming_err": 0}
-
-
-def get_persist_diagnostics() -> dict:
-    return {
-        "direct_storage_enabled": direct_storage_enabled(),
-        "counters": dict(_persist_counters),
-        "last_error": _last_persist_error,
-    }
-
-
-def reset_persist_diagnostics() -> None:
-    global _last_persist_error
-    _last_persist_error = None
-    for k in list(_persist_counters.keys()):
-        _persist_counters[k] = 0
-
-
-def _try_direct_write(kind: str, payload: dict) -> None:
-    global _last_persist_error
-    if not direct_storage_enabled():
-        _last_persist_error = {"kind": kind, "error": "direct_storage_disabled (SUPABASE_DB_URL absent)"}
-        return
-    try:
-        if kind == "incoming":
-            upsert_incoming(payload)
-            _persist_counters["incoming_ok"] += 1
-        else:
-            upsert_sync_chat(payload)
-            _persist_counters["sync_chat_ok"] += 1
-    except Exception as exc:
-        import traceback as _tb
-        tb = _tb.format_exc()
-        _persist_counters[f"{'incoming' if kind == 'incoming' else 'sync_chat'}_err"] += 1
-        _last_persist_error = {
-            "kind": kind,
-            "error": f"{type(exc).__name__}: {exc}",
-            "traceback": tb.splitlines()[-6:],
-            "payload_keys": list(payload.keys()),
-            "owner_id": payload.get("owner_id"),
-            "account_id": payload.get("account_id"),
-            "telegram_chat_id": payload.get("telegram_chat_id"),
-        }
-        print(f"[telethon] écriture directe {kind} ÉCHEC: {exc}\n{tb}")
-
-
-async def _persist_payload(kind: str, payload: dict) -> None:
-    """Écrit en base directement; le webhook reste un secours non bloquant."""
-    if direct_storage_enabled():
-        _try_direct_write(kind, payload)
-        return
-    await post_to_lovable(kind, payload)
-
-
-async def _forward_message(event, owner_id: str, account_id: str, direction: str) -> None:
-    """Transforme un événement Telethon en payload pour Lovable."""
+async def _forward(event, owner_id: str, account_id: str, direction: str):
     try:
         msg = event.message
         chat = await event.get_chat()
 
-        # On ignore groupes et channels (CRM = DM uniquement)
         if not isinstance(chat, User):
             return
 
         sender = await event.get_sender() if direction == "in" else chat
-        full_name = " ".join(filter(None, [getattr(sender, "first_name", None), getattr(sender, "last_name", None)])).strip() or (getattr(sender, "username", None) or "Inconnu")
-        username = getattr(sender, "username", None)
-        handle = f"@{username}" if username else f"id:{sender.id}"
-        initials = "".join([p[0] for p in full_name.split()[:2]]).upper() or full_name[:2].upper()
 
         payload = {
             "owner_id": owner_id,
             "account_id": account_id,
             "telegram_chat_id": chat.id,
-            "telegram_access_hash": str(getattr(chat, "access_hash", "") or ""),
             "telegram_message_id": msg.id,
             "direction": direction,
             "body": msg.message or "",
             "sent_at": msg.date.isoformat() if msg.date else None,
-            "contact": {
+        }
+
+        if direct_storage_enabled():
+            upsert_incoming(payload)
+        else:
+            await post_to_lovable("incoming", payload)
+
+    except Exception as e:
+        print(f"[telethon] forward error: {e}")
+
+# ---------------- RESTORE SESSIONS ----------------
+
+async def restore_all_sessions():
+    sessions = list_all_sessions()
+    print(f"[telethon] restore {len(sessions)} sessions")
+
+    for s in sessions:
+        try:
+            await _connect(
+                owner_id=s["owner_id"],
+                account_id=s["account_id"],
+                session_string=s["session_string"],
+            )
+        except Exception as e:
+            print(f"[telethon] restore error {s['account_id']}: {e}")
+
+# ---------------- CONNECT ----------------
+
+async def _connect(*, owner_id: str, account_id: str, session_string: str):
+    client = _new_client(session_string)
+
+    await client.connect()
+
+    if not await client.is_user_authorized():
+        await client.disconnect()
+        return
+
+    _attach_handlers(client, owner_id, account_id)
+
+    _clients[account_id] = client
+    _owners[account_id] = owner_id
+
+    # 🔥 IMPORTANT : ACTIVER EVENTS LIVE
+    asyncio.create_task(_run_client_forever(client, account_id))
+
+    print(f"[telethon] connected {account_id}")
+
+    return client
+
+# ---------------- FINALIZE LOGIN ----------------
+
+async def _finalize(account_id: str, client: TelegramClient, user: User):
+    owner_id = _owners[account_id]
+
+    save_session(
+        owner_id=owner_id,
+        account_id=account_id,
+        session_string=client.session.save(),
+        telegram_user_id=user.id,
+        phone_number=user.phone,
+    )
+
+    _attach_handlers(client, owner_id, account_id)
+
+    _clients[account_id] = client
+
+    # 🔥 CRITIQUE LIVE LOOP
+    asyncio.create_task(_run_client_forever(client, account_id))
+
+    print(f"[telethon] login complete {account_id}")
+
+    return {"status": "success"}
+
+# ---------------- QR LOGIN ----------------
+
+async def start_qr_login(owner_id: str, account_id: str):
+    client = _new_client()
+    await client.connect()
+
+    qr = await client.qr_login()
+
+    _pending_qr[account_id] = {
+        "client": client,
+        "qr": qr,
+    }
+
+    _owners[account_id] = owner_id
+
+    return {"qr_url": qr.url}
+
+
+async def check_qr_login(account_id: str):
+    pending = _pending_qr.get(account_id)
+    if not pending:
+        return {"status": "none"}
+
+    qr = pending["qr"]
+    client = pending["client"]
+
+    try:
+        user = await qr.wait(timeout=2)
+    except asyncio.TimeoutError:
+        return {"status": "waiting"}
+
+    owner_id = _owners[account_id]
+
+    del _pending_qr[account_id]
+
+    return await _finalize(account_id, client, user)
+
+# ---------------- PHONE LOGIN ----------------
+
+async def send_phone_code(owner_id: str, account_id: str, phone: str):
+    client = _new_client()
+    await client.connect()
+
+    sent = await client.send_code_request(phone)
+
+    _pending_phone[account_id] = {
+        "client": client,
+        "phone": phone,
+        "hash": sent.phone_code_hash,
+    }
+
+    _owners[account_id] = owner_id
+
+    return {"status": "code_sent"}
+
+
+async def verify_phone_code(account_id: str, code: str, phone_code_hash: str = None):
+    pending = _pending_phone.get(account_id)
+    if not pending:
+        return {"error": "no_pending"}
+
+    client = pending["client"]
+
+    user = await client.sign_in(
+        phone=pending["phone"],
+        code=code,
+        phone_code_hash=phone_code_hash or pending["hash"]
+    )
+
+    del _pending_phone[account_id]
+
+    return await _finalize(account_id, client, user)
+
+# ---------------- UTIL ----------------
+
+def get_client(account_id: str):
+    return _clients.get(account_id)            "contact": {
                 "name": full_name,
                 "handle": handle,
                 "initials": initials,
