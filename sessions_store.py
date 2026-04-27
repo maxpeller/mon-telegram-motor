@@ -45,11 +45,12 @@ def load_session(account_id: str) -> Optional[str]:
         .table("telethon_sessions")
         .select("session_string")
         .eq("account_id", account_id)
-        .maybe_single()
+        .limit(1)
         .execute()
     )
-    if res and res.data and res.data.get("session_string"):
-        return res.data["session_string"]
+    rows = res.data or []
+    if rows and rows[0].get("session_string"):
+        return rows[0]["session_string"]
     return None
 
 
@@ -61,8 +62,7 @@ def save_session(
     telegram_user_id: Optional[int] = None,
     phone_number: Optional[str] = None,
 ) -> None:
-    """Upsert d'une session Telethon (clé unique : owner_id + account_id)."""
-    payload: dict = {
+    payload = {
         "owner_id": owner_id,
         "account_id": account_id,
         "session_string": session_string,
@@ -72,12 +72,10 @@ def save_session(
     if phone_number is not None:
         payload["phone_number"] = phone_number
 
-    (
-        get_supabase()
-        .table("telethon_sessions")
-        .upsert(payload, on_conflict="owner_id,account_id")
-        .execute()
-    )
+    # upsert sur (owner_id, account_id)
+    get_supabase().table("telethon_sessions").upsert(
+        payload, on_conflict="owner_id,account_id"
+    ).execute()
 
 
 def list_all_sessions() -> list[dict]:
@@ -92,12 +90,6 @@ def list_all_sessions() -> list[dict]:
 
 
 def delete_session(account_id: str) -> None:
-    """Supprime la session Telethon associée à un compte (logout)."""
-    (
-        get_supabase()
-        .table("telethon_sessions")
-        .delete()
-        .eq("account_id", account_id)
-        .execute()
-    )
-
+    get_supabase().table("telethon_sessions").delete().eq(
+        "account_id", account_id
+    ).execute()
