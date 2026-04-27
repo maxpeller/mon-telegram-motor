@@ -4,9 +4,6 @@ API HTTP du service Telethon.
 Sécurité : toutes les routes (sauf /health) exigent le header
     X-Service-Auth: <SERVICE_API_KEY>
 qui doit correspondre à la variable d'env SERVICE_API_KEY.
-
-C'est l'app Lovable qui appelle ces routes (jamais le navigateur de
-l'utilisateur final directement).
 """
 import asyncio
 import os
@@ -18,12 +15,22 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from sessions_store import storage_backend
+from sessions_store import storage_backend, db_health_check
 import telegram_client as tg
-from sync_store import get_sync_status, set_sync_status
 
 SERVICE_API_KEY = os.environ.get("SERVICE_API_KEY", "")
-SERVICE_VERSION = "2026-04-27-direct-db-sync"
+SERVICE_VERSION = "2026-04-27-railway-hard-reset"
+
+REQUIRED_ENV = [
+    "TELEGRAM_API_ID",
+    "TELEGRAM_API_HASH",
+    "SERVICE_API_KEY",
+    "SUPABASE_DB_URL",
+]
+
+
+def _missing_env() -> list[str]:
+    return [name for name in REQUIRED_ENV if not os.environ.get(name)]
 
 
 def _check_auth(x_service_auth: Optional[str]) -> None:
@@ -35,11 +42,19 @@ def _check_auth(x_service_auth: Optional[str]) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("[startup] restauration des sessions Telethon")
-    try:
-        await tg.restore_all_sessions()
-    except Exception as exc:
-        print(f"[startup] erreur restore: {exc}")
+    print(f"[startup] service version={SERVICE_VERSION}")
+    missing = _missing_env()
+    if missing:
+        print(f"[startup] ERREUR: variables manquantes: {missing}")
+    db = db_health_check()
+    print(f"[startup] db_health: {db}")
+    if not missing and db.get("ok"):
+        try:
+            await tg.restore_all_sessions()
+        except Exception as exc:
+            print(f"[startup] erreur restore: {exc}")
+    else:
+        print("[startup] restauration sessions ignorée (config incomplète)")
     yield
     print("[shutdown] déconnexion des clients")
 
@@ -60,12 +75,53 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 
 @app.get("/health")
 async def health():
+    missing = _missing_env()
+    db = db_health_check()
+    backend = storage_backend()
+    ok = (not missing) and db.get("ok", False) and backend == "direct_db"
     return {
-        "ok": True,
+        "ok": ok,
         "service": "telethon",
         "version": SERVICE_VERSION,
         "active_clients": len(tg._clients),
+        "session_storage": backend,
+        "database_ok": db.get("ok", False),
+        "database_error": db.get("error"),
+        "telethon_sessions_count": db.get("telethon_sessions_count"),
+        "missing_env": missing,
+        "env_present": {name: bool(os.environ.get(name)) for name in REQUIRED_ENV},
+    }
+
+
+@app.get("/diagnostics")
+async def diagnostics(x_service_auth: Optional[str] = Header(None)):
+    _check_auth(x_service_auth)
+    return {
+        "ok": True,
+        "version": SERVICE_VERSION,
         "session_storage": storage_backend(),
+        "active_clients": list(tg._clients.keys()),
+        "persistence": tg.get_persist_diagnostics(),
+        "database": db_health_check(),
+    }
+
+
+@app.post("/admin/reload")
+async def admin_reload(x_service_auth: Optional[str] = Header(None)):
+    """Reset diagnostics + recharge les sessions Telegram depuis la base."""
+    _check_auth(x_service_auth)
+    missing = _missing_env()
+    if missing:
+        raise HTTPException(500, f"Variables manquantes: {missing}")
+    db = db_health_check()
+    if not db.get("ok"):
+        raise HTTPException(500, f"DB indisponible: {db.get('error')}")
+    tg.reset_persist_diagnostics()
+    await tg.restore_all_sessions()
+    return {
+        "ok": True,
+        "version": SERVICE_VERSION,
+        "active_clients": list(tg._clients.keys()),
     }
 
 
@@ -121,7 +177,6 @@ async def phone_send_code(body: StartPhoneBody, x_service_auth: Optional[str] = 
     )
 
 
-# Alias rétro-compatible
 @app.post("/accounts/login/phone/start")
 async def phone_start(body: StartPhoneBody, x_service_auth: Optional[str] = Header(None)):
     _check_auth(x_service_auth)
@@ -148,7 +203,6 @@ async def phone_verify_code(body: PhoneCodeBody, x_service_auth: Optional[str] =
     )
 
 
-# Alias rétro-compatible
 @app.post("/accounts/login/phone/code")
 async def phone_code(body: PhoneCodeBody, x_service_auth: Optional[str] = Header(None)):
     _check_auth(x_service_auth)
@@ -194,40 +248,11 @@ class SyncBody(BaseModel):
     max_messages_per_chat: int = 200
 
 
-async def _run_sync(account_id: str, max_chats: int, max_messages_per_chat: int) -> None:
-    set_sync_status(account_id, {"running": True, "error": None, "result": None})
-    try:
-        result = await tg.sync_history(
-            account_id=account_id,
-            max_chats=max_chats,
-            max_messages_per_chat=max_messages_per_chat,
-        )
-        set_sync_status(account_id, {"running": False, "error": None, "result": result})
-    except Exception as exc:
-        print(f"[sync] erreur sync_history {account_id}: {exc}")
-        set_sync_status(account_id, {"running": False, "error": str(exc), "result": None})
-
-
 @app.post("/sync/history")
 async def sync_history(body: SyncBody, x_service_auth: Optional[str] = Header(None)):
     _check_auth(x_service_auth)
-    status = get_sync_status(body.account_id)
-    if status and status.get("running"):
-        return {"ok": True, "started": False, "already_running": True}
-    asyncio.create_task(
-        _run_sync(
-            account_id=body.account_id,
-            max_chats=body.max_chats,
-            max_messages_per_chat=body.max_messages_per_chat,
-        )
+    return await tg.sync_history(
+        account_id=body.account_id,
+        max_chats=body.max_chats,
+        max_messages_per_chat=body.max_messages_per_chat,
     )
-    return {"ok": True, "started": True}
-
-
-@app.get("/sync/status/{account_id}")
-async def sync_status(account_id: str, x_service_auth: Optional[str] = Header(None)):
-    _check_auth(x_service_auth)
-    status = get_sync_status(account_id)
-    if status is None:
-        return {"ok": True, "account_id": account_id, "status": "never_started"}
-    return {"ok": True, "account_id": account_id, **status}
