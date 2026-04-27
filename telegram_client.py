@@ -325,6 +325,18 @@ async def sync_history(*, account_id: str, max_chats: int = 50, max_messages_per
     if not client:
         return {"ok": False, "error": "account_not_connected"}
 
+    # Reconnect before iterating history to avoid stale-connection errors
+    try:
+        if not client.is_connected():
+            print(f"[sync_history] client {account_id} déconnecté, reconnexion...")
+            await client.connect()
+        if not await client.is_user_authorized():
+            print(f"[sync_history] session expirée pour {account_id}, abandon")
+            return {"ok": False, "error": "session_expired"}
+    except Exception as exc:
+        print(f"[sync_history] erreur reconnexion {account_id}: {exc}")
+        return {"ok": False, "error": f"reconnect_failed: {exc}"}
+
     owner_id = _owners[account_id]
     chats_synced = 0
     messages_synced = 0

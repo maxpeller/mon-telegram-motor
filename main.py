@@ -20,9 +20,10 @@ from pydantic import BaseModel
 
 from sessions_store import storage_backend
 import telegram_client as tg
+from sync_store import get_sync_status, set_sync_status
 
 SERVICE_API_KEY = os.environ.get("SERVICE_API_KEY", "")
-SERVICE_VERSION = "2026-04-27-cache-safe-sessions"
+SERVICE_VERSION = "2026-04-27-sync-reconnect-before-history"
 
 
 def _check_auth(x_service_auth: Optional[str]) -> None:
@@ -193,11 +194,28 @@ class SyncBody(BaseModel):
     max_messages_per_chat: int = 200
 
 
+async def _run_sync(account_id: str, max_chats: int, max_messages_per_chat: int) -> None:
+    set_sync_status(account_id, {"running": True, "error": None, "result": None})
+    try:
+        result = await tg.sync_history(
+            account_id=account_id,
+            max_chats=max_chats,
+            max_messages_per_chat=max_messages_per_chat,
+        )
+        set_sync_status(account_id, {"running": False, "error": None, "result": result})
+    except Exception as exc:
+        print(f"[sync] erreur sync_history {account_id}: {exc}")
+        set_sync_status(account_id, {"running": False, "error": str(exc), "result": None})
+
+
 @app.post("/sync/history")
 async def sync_history(body: SyncBody, x_service_auth: Optional[str] = Header(None)):
     _check_auth(x_service_auth)
+    status = get_sync_status(body.account_id)
+    if status and status.get("running"):
+        return {"ok": True, "started": False, "already_running": True}
     asyncio.create_task(
-        tg.sync_history(
+        _run_sync(
             account_id=body.account_id,
             max_chats=body.max_chats,
             max_messages_per_chat=body.max_messages_per_chat,
@@ -205,3 +223,11 @@ async def sync_history(body: SyncBody, x_service_auth: Optional[str] = Header(No
     )
     return {"ok": True, "started": True}
 
+
+@app.get("/sync/status/{account_id}")
+async def sync_status(account_id: str, x_service_auth: Optional[str] = Header(None)):
+    _check_auth(x_service_auth)
+    status = get_sync_status(account_id)
+    if status is None:
+        return {"ok": True, "account_id": account_id, "status": "never_started"}
+    return {"ok": True, "account_id": account_id, **status}
