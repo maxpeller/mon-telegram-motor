@@ -10,10 +10,12 @@ l'utilisateur final directement).
 """
 import asyncio
 import os
+import traceback
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 import telegram_client as tg
@@ -40,6 +42,17 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Opsis Telethon Service", lifespan=lifespan)
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    """Évite les 500 nus : renvoie le détail de l'erreur en JSON pour le frontend."""
+    tb = traceback.format_exc()
+    print(f"[unhandled] {request.method} {request.url.path}: {exc}\n{tb}")
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"{type(exc).__name__}: {exc}"},
+    )
 
 
 @app.get("/health")
