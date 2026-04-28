@@ -4,7 +4,7 @@ import traceback
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Reqhuest
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
@@ -250,7 +250,12 @@ async def sync_history(body: SyncBody, x_service_auth: Optional[str] = Header(No
         body.account_id,
         body.max_chats,
         body.max_messages_per_chat,
-    )    """Reset diagnostics + recharge les sessions Telegram depuis la base."""
+    )
+
+
+    @app.post("/admin/reload")
+    async def reload_sessions(x_service_auth: Optional[str] = Header(None)):
+            """Reset diagnostics + recharge les sessions Telegram depuis la base."""
     _check_auth(x_service_auth)
     missing = _missing_env()
     if missing:
